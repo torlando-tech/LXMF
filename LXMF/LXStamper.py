@@ -21,6 +21,17 @@ active_jobs = {}
 if sys.version_info[0] >= 3 and sys.version_info[1] >= 14:
     USE_WORKER_MANAGER          = True
 
+# Optional external stamp generator for embedded hosts where Python
+# multiprocessing is unavailable. Contract:
+# external_generator(workblock: bytes, stamp_cost: int) -> (stamp: bytes, rounds: int)
+external_generator = None
+
+def set_external_generator(generator):
+    global external_generator
+    external_generator = generator
+    if generator is not None:
+        RNS.log("External stamp generator registered", RNS.LOG_DEBUG)
+
 @contextlib.contextmanager
 def worker_context(ctx, stamp_cost, workblock, message_id):
     stop_event = ctx.Event()
@@ -129,7 +140,10 @@ def generate_stamp(message_id, stamp_cost, expand_rounds=WORKBLOCK_EXPAND_ROUNDS
     rounds = 0
     value = 0
 
-    if RNS.vendor.platformutils.is_windows() or RNS.vendor.platformutils.is_darwin(): stamp, rounds = job_simple(stamp_cost, workblock, message_id)
+    if external_generator is not None:
+        RNS.log("Using external stamp generator", RNS.LOG_DEBUG)
+        stamp, rounds = external_generator(workblock, stamp_cost)
+    elif RNS.vendor.platformutils.is_windows() or RNS.vendor.platformutils.is_darwin(): stamp, rounds = job_simple(stamp_cost, workblock, message_id)
     elif RNS.vendor.platformutils.is_android(): stamp, rounds = job_android(stamp_cost, workblock, message_id)
     else:
         if USE_WORKER_MANAGER: stamp, rounds = job_linux_managed(stamp_cost, workblock, message_id)
