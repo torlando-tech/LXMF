@@ -1834,7 +1834,7 @@ class LXMRouter:
     ### Message Routing & Delivery ########################
     #######################################################
 
-    def lxmf_delivery(self, lxmf_data, destination_type = None, phy_stats = None, ratchet_id = None, method = None, no_stamp_enforcement=False, allow_duplicate=False, receiving_interface = None):
+    def lxmf_delivery(self, lxmf_data, destination_type = None, phy_stats = None, ratchet_id = None, method = None, no_stamp_enforcement=False, allow_duplicate=False, receiving_interface = None, receiving_hops = None):
         try:
             message = LXMessage.unpack_from_bytes(lxmf_data)
 
@@ -1845,10 +1845,12 @@ class LXMRouter:
             if ratchet_id and not message.ratchet_id: message.ratchet_id = ratchet_id
             if method: message.method = method
 
-            # For opportunistic messages, store the receiving interface on the message
-            # so delivery callbacks can access it (path_table may not be populated yet)
+            # For opportunistic messages, store the receiving interface and hops on the message
+            # so delivery callbacks can access them (path_table may not be populated yet)
             if receiving_interface is not None:
                 message.receiving_interface = receiving_interface
+            if receiving_hops is not None:
+                message.receiving_hops = receiving_hops
 
             if message.signature_validated and FIELD_TICKET in message.fields:
                 ticket_entry = message.fields[FIELD_TICKET]
@@ -1952,12 +1954,14 @@ class LXMRouter:
             phy_stats = {"rssi": packet.rssi, "snr": packet.snr, "q": packet.q}
 
             # Opportunistic packets can arrive before the path table is populated, so capture
-            # the receiving interface before handing delivery to the background parser.
+            # the receiving interface and hop count before handing delivery to the background parser.
             recv_if = None
+            recv_hops = None
             if method == LXMessage.OPPORTUNISTIC:
                 recv_if = getattr(packet, "receiving_interface", None)
+                recv_hops = getattr(packet, "hops", None)
 
-            def job(): self.lxmf_delivery(lxmf_data, packet.destination_type, phy_stats=phy_stats, ratchet_id=packet.ratchet_id, method=method, receiving_interface=recv_if)
+            def job(): self.lxmf_delivery(lxmf_data, packet.destination_type, phy_stats=phy_stats, ratchet_id=packet.ratchet_id, method=method, receiving_interface=recv_if, receiving_hops=recv_hops)
             threading.Thread(target=job, daemon=True).start()
 
         except Exception as e:
