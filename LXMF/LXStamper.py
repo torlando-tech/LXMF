@@ -244,6 +244,22 @@ def _generate_external_stamp(message_id, stamp_cost, workblock, registration):
         else:
             result = generator(workblock, stamp_cost)
 
+        # Cooperative native generators commonly return an empty/no-stamp
+        # sentinel after observing cancellation. Discard it before validating
+        # the callback payload so expected cancellation is not logged as a
+        # malformed generator result. Completion is checked again below to
+        # cover cancellation or replacement racing with validation.
+        with active_jobs_lock:
+            if job.token.cancelled:
+                RNS.log("Discarding external stamp result after cancellation", RNS.LOG_DEBUG)
+                return None, 0
+            if generation != external_generator_generation or generator is not external_generator:
+                RNS.log("Discarding result from stale external stamp generator", RNS.LOG_DEBUG)
+                return None, 0
+            if active_jobs.get(message_id) is not job:
+                RNS.log("Discarding unregistered external stamp result", RNS.LOG_DEBUG)
+                return None, 0
+
         if not isinstance(result, tuple) or len(result) != 2:
             raise ValueError("result must be a (stamp, rounds) tuple")
 

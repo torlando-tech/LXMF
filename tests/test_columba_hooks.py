@@ -150,13 +150,12 @@ class TestColumbaHooks(unittest.TestCase):
         started = threading.Event()
         release = threading.Event()
         cancel_calls = []
-        expected_stamp = self.stamp_for_cost(b"", 1)
         result = []
 
         def external_generator(_workblock, _cost, cancellation_token):
             started.set()
             release.wait(2)
-            return expected_stamp, 8
+            return b"", 8
 
         def cancel_external(cancellation_token):
             cancel_calls.append(cancellation_token.message_id)
@@ -174,13 +173,15 @@ class TestColumbaHooks(unittest.TestCase):
         self.assertTrue(started.wait(1))
         self.assertIn(message_id, stamper.active_jobs)
 
-        stamper.cancel_work(message_id)
-        worker.join(2)
+        with mock.patch.object(stamper.RNS, "trace_exception") as trace_exception:
+            stamper.cancel_work(message_id)
+            worker.join(2)
 
         self.assertFalse(worker.is_alive())
         self.assertEqual([message_id], cancel_calls)
         self.assertEqual([(None, 0)], result)
         self.assertNotIn(message_id, stamper.active_jobs)
+        trace_exception.assert_not_called()
 
     def test_cancelled_noncooperative_external_job_discards_late_result(self):
         started = threading.Event()
