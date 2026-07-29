@@ -256,8 +256,8 @@ def _generate_external_stamp(message_id, stamp_cost, workblock, registration):
             raise TypeError("rounds must be a non-negative integer")
 
         value = stamp_value(workblock, stamp)
-        if value < stamp_cost:
-            raise ValueError(f"stamp value {value} is below required cost {stamp_cost}")
+        if not stamp_valid(stamp, stamp_cost, workblock):
+            raise ValueError(f"stamp value {value} does not satisfy required cost {stamp_cost}")
 
         # Completion, cancellation and generator replacement are linearised by
         # active_jobs_lock. Once removed here, a later cancellation is a no-op.

@@ -43,7 +43,7 @@ class TestColumbaHooks(unittest.TestCase):
     def stamp_for_cost(workblock, cost):
         for candidate in range(100000):
             stamp = candidate.to_bytes(stamper.STAMP_SIZE, byteorder="big")
-            if stamper.stamp_value(workblock, stamp) >= cost:
+            if stamper.stamp_valid(stamp, cost, workblock):
                 return stamp
         raise AssertionError("could not find inexpensive test stamp")
 
@@ -73,7 +73,19 @@ class TestColumbaHooks(unittest.TestCase):
         stamp, value = stamper.generate_stamp(b"message-id", 3, expand_rounds=0)
 
         self.assertEqual(expected_stamp, stamp)
-        self.assertGreaterEqual(value, 3)
+        self.assertTrue(stamper.stamp_valid(stamp, 3, b""))
+
+    def test_external_generator_accepts_canonical_exact_target_boundary(self):
+        cost = 3
+        boundary_digest = (1 << (256-cost)).to_bytes(32, byteorder="big")
+        expected_stamp = bytes(stamper.STAMP_SIZE)
+        stamper.set_external_generator(lambda _workblock, _cost: (expected_stamp, 1))
+
+        with mock.patch.object(stamper.RNS.Identity, "full_hash", return_value=boundary_digest):
+            stamp, value = stamper.generate_stamp(b"message-id", cost, expand_rounds=0)
+
+        self.assertEqual(expected_stamp, stamp)
+        self.assertEqual(cost-1, value)
 
     def test_external_generator_rejects_malformed_results(self):
         malformed_results = [
@@ -224,6 +236,41 @@ class TestColumbaHooks(unittest.TestCase):
 
         self.assertEqual([message_id], cancel_calls)
         self.assertEqual([(None, 0)], result)
+        self.assertEqual({}, stamper.active_jobs)
+
+    def test_replacement_cancels_active_generator_and_new_generator_is_used(self):
+        started = threading.Event()
+        release = threading.Event()
+        cancel_calls = []
+        stale_stamp = self.stamp_for_cost(b"", 1)
+        fresh_stamp = self.stamp_for_cost(b"", 2)
+        stale_result = []
+
+        def stale_generator(_workblock, _cost, _token):
+            started.set()
+            release.wait(2)
+            return stale_stamp, 3
+
+        def cancel_stale(token):
+            cancel_calls.append(token.message_id)
+            release.set()
+
+        message_id = b"replaced-generator-message"
+        stamper.set_external_generator(stale_generator, cancel_stale)
+        worker = threading.Thread(
+            target=lambda: stale_result.append(stamper.generate_stamp(message_id, 1, expand_rounds=0))
+        )
+        worker.start()
+        self.assertTrue(started.wait(1))
+
+        stamper.set_external_generator(lambda _workblock, _cost: (fresh_stamp, 2))
+        worker.join(2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual([message_id], cancel_calls)
+        self.assertEqual([(None, 0)], stale_result)
+        stamp, _value = stamper.generate_stamp(b"fresh-message", 2, expand_rounds=0)
+        self.assertEqual(fresh_stamp, stamp)
         self.assertEqual({}, stamper.active_jobs)
 
     def test_lxmf_delivery_exposes_receiving_metadata(self):
