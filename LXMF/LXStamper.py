@@ -8,6 +8,8 @@ import math
 import itertools
 import contextlib
 import multiprocessing
+import inspect
+import threading
 
 WORKBLOCK_EXPAND_ROUNDS         = 3000
 WORKBLOCK_EXPAND_ROUNDS_PN      = 1000
@@ -17,18 +19,109 @@ PN_VALIDATION_POOL_MIN_SIZE     = 256
 USE_WORKER_MANAGER              = False
 
 active_jobs = {}
+active_jobs_lock = threading.RLock()
 
 if sys.version_info[0] >= 3 and sys.version_info[1] >= 14:
     USE_WORKER_MANAGER          = True
 
 # Optional external stamp generator for embedded hosts where Python
-# multiprocessing is unavailable. Contract:
-# external_generator(workblock: bytes, stamp_cost: int) -> (stamp: bytes, rounds: int)
+# multiprocessing is unavailable. Two-argument generators remain supported.
+# A generator that accepts a third argument receives an ExternalStampCancellationToken.
 external_generator = None
+external_generator_cancel = None
+external_generator_uses_token = False
+external_generator_generation = 0
 
-def set_external_generator(generator):
-    global external_generator
-    external_generator = generator
+
+class ExternalStampCancellationToken:
+    """Thread-safe cancellation state passed to cooperative external generators."""
+
+    def __init__(self, message_id):
+        self.message_id = message_id
+        self._event = threading.Event()
+
+    @property
+    def cancelled(self):
+        return self._event.is_set()
+
+    def is_cancelled(self):
+        return self._event.is_set()
+
+    def wait(self, timeout=None):
+        return self._event.wait(timeout)
+
+    def _cancel(self):
+        self._event.set()
+
+
+class ExternalStampJob:
+    def __init__(self, message_id, cancel_callback):
+        self.token = ExternalStampCancellationToken(message_id)
+        self.cancel_callback = cancel_callback
+        self._cancel_lock = threading.Lock()
+        self._cancel_callback_called = False
+
+    def request_cancel(self):
+        self.token._cancel()
+        with self._cancel_lock:
+            if self.cancel_callback is not None and not self._cancel_callback_called:
+                self._cancel_callback_called = True
+                return self.cancel_callback
+        return None
+
+    def invoke_cancel_callback(self, callback):
+        if callback is not None:
+            try:
+                callback(self.token)
+            except Exception as e:
+                RNS.log(f"External stamp cancellation callback failed: {e}", RNS.LOG_ERROR)
+                RNS.trace_exception(e)
+
+
+def _accepts_cancellation_token(generator):
+    try:
+        inspect.signature(generator).bind(None, None, None)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def set_external_generator(generator, cancellation_callback=None, pass_cancellation_token=None):
+    """Register an external stamp generator and optionally its cancellation hook.
+
+    Existing ``generator(workblock, cost)`` callbacks are supported. Callbacks that
+    accept ``generator(workblock, cost, token)`` can cooperatively poll or wait on
+    the token. The optional cancellation callback receives that same token. Opaque
+    bridge callables can set ``pass_cancellation_token=True`` explicitly when their
+    signature cannot be inspected reliably.
+    """
+    global external_generator, external_generator_cancel, external_generator_uses_token, external_generator_generation
+
+    if generator is None and cancellation_callback is not None:
+        raise ValueError("A cancellation callback requires an external generator")
+    if generator is not None and not callable(generator):
+        raise TypeError("External stamp generator must be callable")
+    if cancellation_callback is not None and not callable(cancellation_callback):
+        raise TypeError("External stamp cancellation callback must be callable")
+    if pass_cancellation_token is not None and not isinstance(pass_cancellation_token, bool):
+        raise TypeError("pass_cancellation_token must be a boolean or None")
+
+    uses_token = False
+    if generator is not None:
+        uses_token = _accepts_cancellation_token(generator) if pass_cancellation_token is None else pass_cancellation_token
+
+    with active_jobs_lock:
+        external_generator_generation += 1
+        external_generator = generator
+        external_generator_cancel = cancellation_callback
+        external_generator_uses_token = uses_token
+        stale_jobs = [job for job in active_jobs.values() if isinstance(job, ExternalStampJob)]
+        stale_callbacks = [(job, job.request_cancel()) for job in stale_jobs]
+
+    # Do not invoke application/native callbacks while holding the jobs lock.
+    for job, callback in stale_callbacks:
+        job.invoke_cancel_callback(callback)
+
     if generator is not None:
         RNS.log("External stamp generator registered", RNS.LOG_DEBUG)
 
@@ -131,40 +224,121 @@ def validate_pn_stamps(transient_list, target_cost):
     if len(transient_list) <= PN_VALIDATION_POOL_MIN_SIZE or non_mp_platform: return validate_pn_stamps_job_simple(transient_list, target_cost)
     else:                                                                     return validate_pn_stamps_job_multip(transient_list, target_cost)
 
+def _generate_external_stamp(message_id, stamp_cost, workblock, registration):
+    generator, cancellation_callback, uses_token, generation = registration
+    job = ExternalStampJob(message_id, cancellation_callback)
+
+    with active_jobs_lock:
+        if generation != external_generator_generation or generator is not external_generator:
+            RNS.log("Not starting stale external stamp generator", RNS.LOG_DEBUG)
+            return None, 0
+        if message_id in active_jobs:
+            RNS.log(f"Refusing duplicate external stamp job for {RNS.prettyhexrep(message_id)}", RNS.LOG_ERROR)
+            return None, 0
+        active_jobs[message_id] = job
+
+    try:
+        RNS.log("Using external stamp generator", RNS.LOG_DEBUG)
+        if uses_token:
+            result = generator(workblock, stamp_cost, job.token)
+        else:
+            result = generator(workblock, stamp_cost)
+
+        if not isinstance(result, tuple) or len(result) != 2:
+            raise ValueError("result must be a (stamp, rounds) tuple")
+
+        stamp, rounds = result
+        if not isinstance(stamp, bytes):
+            raise TypeError("stamp must be bytes")
+        if len(stamp) != STAMP_SIZE:
+            raise ValueError(f"stamp must be exactly {STAMP_SIZE} bytes")
+        if not isinstance(rounds, int) or isinstance(rounds, bool) or rounds < 0:
+            raise TypeError("rounds must be a non-negative integer")
+
+        value = stamp_value(workblock, stamp)
+        if value < stamp_cost:
+            raise ValueError(f"stamp value {value} is below required cost {stamp_cost}")
+
+        # Completion, cancellation and generator replacement are linearised by
+        # active_jobs_lock. Once removed here, a later cancellation is a no-op.
+        with active_jobs_lock:
+            if job.token.cancelled:
+                RNS.log("Discarding external stamp result after cancellation", RNS.LOG_DEBUG)
+                return None, 0
+            if generation != external_generator_generation or generator is not external_generator:
+                RNS.log("Discarding result from stale external stamp generator", RNS.LOG_DEBUG)
+                return None, 0
+            if active_jobs.get(message_id) is not job:
+                RNS.log("Discarding unregistered external stamp result", RNS.LOG_DEBUG)
+                return None, 0
+            active_jobs.pop(message_id)
+            return stamp, rounds
+
+    except Exception as e:
+        RNS.log(f"External stamp generator failed validation or execution: {e}", RNS.LOG_ERROR)
+        RNS.trace_exception(e)
+        return None, 0
+
+    finally:
+        with active_jobs_lock:
+            if active_jobs.get(message_id) is job:
+                active_jobs.pop(message_id)
+
+
 def generate_stamp(message_id, stamp_cost, expand_rounds=WORKBLOCK_EXPAND_ROUNDS):
     RNS.log(f"Generating stamp with cost {stamp_cost} for {RNS.prettyhexrep(message_id)}...", RNS.LOG_DEBUG)
     workblock = stamp_workblock(message_id, expand_rounds=expand_rounds)
-    
+
     start_time = time.time()
     stamp = None
     rounds = 0
     value = 0
 
-    if external_generator is not None:
-        RNS.log("Using external stamp generator", RNS.LOG_DEBUG)
-        stamp, rounds = external_generator(workblock, stamp_cost)
+    with active_jobs_lock:
+        registration = None
+        if external_generator is not None:
+            registration = (external_generator, external_generator_cancel, external_generator_uses_token, external_generator_generation)
+
+    if registration is not None:
+        stamp, rounds = _generate_external_stamp(message_id, stamp_cost, workblock, registration)
     elif RNS.vendor.platformutils.is_windows() or RNS.vendor.platformutils.is_darwin(): stamp, rounds = job_simple(stamp_cost, workblock, message_id)
     elif RNS.vendor.platformutils.is_android(): stamp, rounds = job_android(stamp_cost, workblock, message_id)
     else:
         if USE_WORKER_MANAGER: stamp, rounds = job_linux_managed(stamp_cost, workblock, message_id)
         else:                  stamp, rounds = job_linux(stamp_cost, workblock, message_id)
-    
+
     duration = time.time() - start_time
-    speed = rounds/duration
-    if stamp != None: value = stamp_value(workblock, stamp)
+    speed = rounds/duration if duration > 0 else 0
+    if stamp is not None: value = stamp_value(workblock, stamp)
 
     RNS.log(f"Stamp with value {value} generated in {RNS.prettytime(duration)}, {rounds} rounds, {int(speed)} rounds per second", RNS.LOG_DEBUG)
 
     return stamp, value
 
+
 def cancel_work(message_id):
+    external_job = None
+    with active_jobs_lock:
+        job = active_jobs.get(message_id)
+        if isinstance(job, ExternalStampJob):
+            external_job = job
+
+    if external_job is not None:
+        with active_jobs_lock:
+            # The job may have completed after the first lookup.
+            if active_jobs.get(message_id) is not external_job:
+                return
+            callback = external_job.request_cancel()
+        external_job.invoke_cancel_callback(callback)
+        return
+
     if RNS.vendor.platformutils.is_windows() or RNS.vendor.platformutils.is_darwin():
         try:
             if message_id in active_jobs:
                 active_jobs[message_id] = True
 
         except Exception as e:
-            RNS.log("Error while terminating stamp generation workers: {e}", RNS.LOG_ERROR)
+            RNS.log(f"Error while terminating stamp generation workers: {e}", RNS.LOG_ERROR)
             RNS.trace_exception(e)
 
     elif RNS.vendor.platformutils.is_android():
@@ -173,7 +347,7 @@ def cancel_work(message_id):
                 active_jobs[message_id] = True
 
         except Exception as e:
-            RNS.log("Error while terminating stamp generation workers: {e}", RNS.LOG_ERROR)
+            RNS.log(f"Error while terminating stamp generation workers: {e}", RNS.LOG_ERROR)
             RNS.trace_exception(e)
 
     else:
@@ -186,7 +360,7 @@ def cancel_work(message_id):
                 active_jobs.pop(message_id)
 
         except Exception as e:
-            RNS.log("Error while terminating stamp generation workers: {e}", RNS.LOG_ERROR)
+            RNS.log(f"Error while terminating stamp generation workers: {e}", RNS.LOG_ERROR)
             RNS.trace_exception(e)
 
 def job_simple(stamp_cost, workblock, message_id):

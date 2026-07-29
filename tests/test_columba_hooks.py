@@ -20,24 +20,211 @@ class ImmediateThread:
         self.target()
 
 
+class DeferredThread(ImmediateThread):
+    instances = []
+
+    def __init__(self, target, daemon=None):
+        super().__init__(target, daemon)
+        self.__class__.instances.append(self)
+
+    def start(self):
+        pass
+
+    def run(self):
+        self.target()
+
+
 class TestColumbaHooks(unittest.TestCase):
     def tearDown(self):
         stamper.set_external_generator(None)
+        self.assertEqual({}, stamper.active_jobs)
 
-    def test_external_stamp_generator_takes_precedence(self):
+    @staticmethod
+    def stamp_for_cost(workblock, cost):
+        for candidate in range(100000):
+            stamp = candidate.to_bytes(stamper.STAMP_SIZE, byteorder="big")
+            if stamper.stamp_value(workblock, stamp) >= cost:
+                return stamp
+        raise AssertionError("could not find inexpensive test stamp")
+
+    def test_external_stamp_generator_takes_precedence_on_android(self):
         calls = []
-        expected_stamp = bytes(range(stamper.STAMP_SIZE))
+        expected_stamp = self.stamp_for_cost(b"", 1)
 
         def external_generator(workblock, stamp_cost):
             calls.append((workblock, stamp_cost))
-            return expected_stamp, 1
+            return expected_stamp, 7
 
         stamper.set_external_generator(external_generator)
-        stamp, value = stamper.generate_stamp(b"message-id", 0, expand_rounds=0)
+        with (
+            mock.patch.object(stamper.RNS.vendor.platformutils, "is_android", return_value=True),
+            mock.patch.object(stamper, "job_android", side_effect=AssertionError("native Android workers selected")),
+        ):
+            stamp, value = stamper.generate_stamp(b"message-id", 1, expand_rounds=0)
 
         self.assertEqual(expected_stamp, stamp)
-        self.assertEqual(stamper.stamp_value(b"", expected_stamp), value)
-        self.assertEqual([(b"", 0)], calls)
+        self.assertGreaterEqual(value, 1)
+        self.assertEqual([(b"", 1)], calls)
+
+    def test_external_generator_accepts_valid_nonzero_cost_stamp(self):
+        expected_stamp = self.stamp_for_cost(b"", 3)
+        stamper.set_external_generator(lambda _workblock, _cost: (expected_stamp, 42))
+
+        stamp, value = stamper.generate_stamp(b"message-id", 3, expand_rounds=0)
+
+        self.assertEqual(expected_stamp, stamp)
+        self.assertGreaterEqual(value, 3)
+
+    def test_external_generator_rejects_malformed_results(self):
+        malformed_results = [
+            None,
+            b"not-a-tuple",
+            (b"only-one-item",),
+            (b"one", 1, "extra"),
+            [bytes(stamper.STAMP_SIZE), 1],
+            ("not-bytes", 1),
+            (bytearray(stamper.STAMP_SIZE), 1),
+            (bytes(stamper.STAMP_SIZE), "not-an-int"),
+            (bytes(stamper.STAMP_SIZE), True),
+            (bytes(stamper.STAMP_SIZE), -1),
+            (bytes(stamper.STAMP_SIZE - 1), 1),
+            (bytes(stamper.STAMP_SIZE + 1), 1),
+        ]
+        for result in malformed_results:
+            with self.subTest(result=result):
+                def external_generator(_workblock, _cost):
+                    return result
+
+                stamper.set_external_generator(external_generator)
+                with mock.patch.object(stamper.RNS, "log") as log:
+                    stamp, value = stamper.generate_stamp(b"message-id", 0, expand_rounds=0)
+                self.assertIsNone(stamp)
+                self.assertEqual(0, value)
+                self.assertTrue(log.called)
+                self.assertEqual({}, stamper.active_jobs)
+
+    def test_external_generator_rejects_insufficient_stamp_value(self):
+        insufficient_stamp = next(
+            candidate.to_bytes(stamper.STAMP_SIZE, byteorder="big")
+            for candidate in range(100)
+            if stamper.stamp_value(b"", candidate.to_bytes(stamper.STAMP_SIZE, byteorder="big")) == 0
+        )
+        self.assertEqual(0, stamper.stamp_value(b"", insufficient_stamp))
+        stamper.set_external_generator(lambda _workblock, _cost: (insufficient_stamp, 1))
+
+        stamp, value = stamper.generate_stamp(b"message-id", 24, expand_rounds=0)
+
+        self.assertIsNone(stamp)
+        self.assertEqual(0, value)
+
+    def test_external_generator_exception_fails_closed_and_cleans_up(self):
+        def exploding_generator(_workblock, _cost):
+            raise RuntimeError("native bridge failed")
+
+        stamper.set_external_generator(exploding_generator)
+        with (
+            mock.patch.object(stamper.RNS, "log") as log,
+            mock.patch.object(stamper.RNS, "trace_exception") as trace_exception,
+        ):
+            stamp, value = stamper.generate_stamp(b"message-id", 0, expand_rounds=0)
+
+        self.assertIsNone(stamp)
+        self.assertEqual(0, value)
+        self.assertEqual({}, stamper.active_jobs)
+        self.assertTrue(any("external stamp generator" in str(call).lower() for call in log.call_args_list))
+        trace_exception.assert_called_once()
+
+    def test_cancel_work_reaches_cooperative_external_job_and_discards_result(self):
+        started = threading.Event()
+        release = threading.Event()
+        cancel_calls = []
+        expected_stamp = self.stamp_for_cost(b"", 1)
+        result = []
+
+        def external_generator(_workblock, _cost, cancellation_token):
+            started.set()
+            release.wait(2)
+            return expected_stamp, 8
+
+        def cancel_external(cancellation_token):
+            cancel_calls.append(cancellation_token.message_id)
+            self.assertTrue(cancellation_token.cancelled)
+            release.set()
+
+        message_id = b"cancelled-message"
+        stamper.set_external_generator(
+            external_generator, cancel_external, pass_cancellation_token=True
+        )
+        worker = threading.Thread(
+            target=lambda: result.append(stamper.generate_stamp(message_id, 1, expand_rounds=0))
+        )
+        worker.start()
+        self.assertTrue(started.wait(1))
+        self.assertIn(message_id, stamper.active_jobs)
+
+        stamper.cancel_work(message_id)
+        worker.join(2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual([message_id], cancel_calls)
+        self.assertEqual([(None, 0)], result)
+        self.assertNotIn(message_id, stamper.active_jobs)
+
+    def test_cancelled_noncooperative_external_job_discards_late_result(self):
+        started = threading.Event()
+        release = threading.Event()
+        expected_stamp = self.stamp_for_cost(b"", 1)
+        result = []
+
+        def external_generator(_workblock, _cost):
+            started.set()
+            release.wait(2)
+            return expected_stamp, 5
+
+        message_id = b"noncooperative-message"
+        stamper.set_external_generator(external_generator)
+        worker = threading.Thread(
+            target=lambda: result.append(stamper.generate_stamp(message_id, 1, expand_rounds=0))
+        )
+        worker.start()
+        self.assertTrue(started.wait(1))
+        stamper.cancel_work(message_id)
+        release.set()
+        worker.join(2)
+
+        self.assertEqual([(None, 0)], result)
+        self.assertNotIn(message_id, stamper.active_jobs)
+
+    def test_reset_cancels_active_generator_and_prevents_stale_result(self):
+        started = threading.Event()
+        release = threading.Event()
+        cancel_calls = []
+        expected_stamp = self.stamp_for_cost(b"", 1)
+        result = []
+
+        def external_generator(_workblock, _cost, _token):
+            started.set()
+            release.wait(2)
+            return expected_stamp, 3
+
+        def cancel_external(token):
+            cancel_calls.append(token.message_id)
+            release.set()
+
+        message_id = b"stale-generator-message"
+        stamper.set_external_generator(external_generator, cancel_external)
+        worker = threading.Thread(
+            target=lambda: result.append(stamper.generate_stamp(message_id, 1, expand_rounds=0))
+        )
+        worker.start()
+        self.assertTrue(started.wait(1))
+
+        stamper.set_external_generator(None)
+        worker.join(2)
+
+        self.assertEqual([message_id], cancel_calls)
+        self.assertEqual([(None, 0)], result)
+        self.assertEqual({}, stamper.active_jobs)
 
     def test_lxmf_delivery_exposes_receiving_metadata(self):
         delivered = []
@@ -73,7 +260,8 @@ class TestColumbaHooks(unittest.TestCase):
         self.assertEqual(3, message.receiving_hops)
         self.assertEqual([message], delivered)
 
-    def test_opportunistic_packet_forwards_metadata_through_worker(self):
+    def test_opportunistic_packet_captures_metadata_before_async_handoff(self):
+        DeferredThread.instances = []
         router = object.__new__(router_module.LXMRouter)
         router.lxmf_delivery = mock.Mock(return_value=True)
         packet = types.SimpleNamespace(
@@ -91,9 +279,13 @@ class TestColumbaHooks(unittest.TestCase):
 
         with (
             mock.patch.object(router_module.RNS.Reticulum, "get_instance", return_value=mock.Mock()),
-            mock.patch.object(router_module.threading, "Thread", ImmediateThread),
+            mock.patch.object(router_module.threading, "Thread", DeferredThread),
         ):
             router.delivery_packet(b"payload", packet)
+
+        packet.receiving_interface = "mutated-interface"
+        packet.hops = 99
+        DeferredThread.instances[0].run()
 
         packet.prove.assert_called_once_with()
         router.lxmf_delivery.assert_called_once_with(
