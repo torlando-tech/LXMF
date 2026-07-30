@@ -270,6 +270,8 @@ def _generate_external_stamp(message_id, stamp_cost, workblock, registration):
             raise ValueError(f"stamp must be exactly {STAMP_SIZE} bytes")
         if not isinstance(rounds, int) or isinstance(rounds, bool) or rounds < 0:
             raise TypeError("rounds must be a non-negative integer")
+        if rounds > 0x7FFFFFFFFFFFFFFF:
+            raise ValueError("rounds exceeds the supported 64-bit work counter")
 
         value = stamp_value(workblock, stamp)
         if not stamp_valid(stamp, stamp_cost, workblock):

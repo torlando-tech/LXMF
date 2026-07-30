@@ -99,6 +99,7 @@ class TestColumbaHooks(unittest.TestCase):
             (bytes(stamper.STAMP_SIZE), "not-an-int"),
             (bytes(stamper.STAMP_SIZE), True),
             (bytes(stamper.STAMP_SIZE), -1),
+            (bytes(stamper.STAMP_SIZE), 10**10000),
             (bytes(stamper.STAMP_SIZE - 1), 1),
             (bytes(stamper.STAMP_SIZE + 1), 1),
         ]
