@@ -12,7 +12,7 @@ FIELD_ICON_APPEARANCE  = 0x04
 FIELD_FILE_ATTACHMENTS = 0x05
 FIELD_IMAGE            = 0x06
 FIELD_AUDIO            = 0x07
-FIELD_THREAD           = 0x08
+FIELD_THREAD           = 0x08 # Bytes, full thread ID hash
 FIELD_COMMANDS         = 0x09
 FIELD_RESULTS          = 0x0A
 FIELD_GROUP            = 0x0B
@@ -20,6 +20,16 @@ FIELD_TICKET           = 0x0C
 FIELD_EVENT            = 0x0D
 FIELD_RNR_REFS         = 0x0E
 FIELD_RENDERER         = 0x0F
+FIELD_REPLY_TO         = 0x30 # Bytes, full LXMessage.hash
+FIELD_REPLY_QUOTE      = 0x31 # Bytes, quoted content in UTF-8 encoding
+FIELD_REACTION         = 0x40 # Dict, see "Reaction dict indices" below
+FIELD_COMMENT          = 0x41 # Dict, see "Comment dict indices" below
+FIELD_CONTINUATION     = 0x42 # Dict, see "Continuation dict indices" below
+
+# Unallocated fields between 0x00 and 0x80, both included,
+# should be considered reserved for future extensibility
+# For experimental and unstable features, it is recommended
+# to use fields above 0xFF.
 
 # For usecases such as including custom data structures,
 # embedding or encapsulating other data types or protocols
@@ -91,6 +101,30 @@ RENDERER_MICRON        = 0x01
 RENDERER_MARKDOWN      = 0x02
 RENDERER_BBCODE        = 0x03
 
+# Clients choose how to handle reaction content, if at all.
+# While reactions are typically a single unicode emoji or
+# similar, the exact implementation and sanitization is
+# left up to the client. When using the FIELD_REACTION
+# field, the contents is a dict with the following keys:
+REACTION_TO            = 0x00 # Bytes, full LXMessage.hash
+REACTION_CONTENT       = 0x01 # Bytes, the reaction content in UTF-8 encoding
+
+# Clients choose how to handle messages intended as comments
+# for other message, if at all. The actual comment content
+# is carried as the normal LXM content, meaning clients that
+# do not support comments will display them as normal messages.
+# When using the FIELD_COMMENT field, the contents is a dict
+# with the following keys:
+COMMENT_FOR            = 0x00 # Bytes, full LXMessage.hash
+
+# Clients choose how to handle messages that continue earlier
+# messages, if at all. The actual continuation content is
+# carried as the normal LXM content, meaning clients that
+# do not support continuations will display them as normal.
+# When using the FIELD_CONTINUATION field, the contents is a
+# dict with the following keys:
+CONTINUATION_OF        = 0x00 # Bytes, full LXMessage.hash
+
 # Optional propagation node metadata fields. These
 # fields may be highly unstable in allocation and
 # availability until the version 1.0.0 release, so use
@@ -102,6 +136,10 @@ PN_META_SYNC_THROTTLE  = 0x03
 PN_META_AUTH_BAND      = 0x04
 PN_META_UTIL_PRESSURE  = 0x05
 PN_META_CUSTOM         = 0xFF
+
+# Supported functionality codes for signalling
+# feature and capability support.
+SF_COMPRESSION         = 0x00
 
 ##########################################################
 # The following helper functions makes it easier to      #
@@ -124,15 +162,14 @@ def display_name_from_app_data(app_data=None):
                     if dn == None: return None
                     else:
                         try:
-                            decoded = dn.decode("utf-8")
+                            decoded = dn.decode("utf-8").replace("\x00", "").strip()
                             return decoded
                         except Exception as e:
                             RNS.log(f"Could not decode display name in included announce data. The contained exception was: {e}", RNS.LOG_ERROR)
                             return None
 
         # Original announce format
-        else:
-            return app_data.decode("utf-8")
+        else: return app_data.decode("utf-8")
 
 def stamp_cost_from_app_data(app_data=None):
     if app_data == None or app_data == b"": return None
@@ -146,6 +183,21 @@ def stamp_cost_from_app_data(app_data=None):
 
         # Original announce format
         else: return None
+
+def compression_support_from_app_data(app_data=None):
+    if app_data == None or app_data == b"": return None
+    else:
+        # Version 0.5.0+ announce format
+        if (app_data[0] >= 0x90 and app_data[0] <= 0x9f) or app_data[0] == 0xdc:
+            peer_data = msgpack.unpackb(app_data)
+            if type(peer_data) == list:
+                if len(peer_data) < 3: return True
+                else:
+                    if not type(peer_data[2]) == list: return True
+                    else: return SF_COMPRESSION in peer_data[2]
+
+        # Original announce format
+        else: return True
 
 def pn_name_from_app_data(app_data=None):
     if app_data == None: return None
@@ -166,8 +218,8 @@ def pn_stamp_cost_from_app_data(app_data=None):
         if pn_announce_data_is_valid(app_data):
             data = msgpack.unpackb(app_data)
             return data[5][0]
-        else:
-            return None
+        
+        else: return None
 
 def pn_announce_data_is_valid(data):
     try:

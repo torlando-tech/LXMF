@@ -18,7 +18,7 @@ class LXMFDeliveryAnnounceHandler:
             self.lxmrouter.update_stamp_cost(destination_hash, stamp_cost)
 
         except Exception as e:
-            RNS.log(f"An error occurred while trying to decode announced stamp cost. The contained exception was: {e}", RNS.LOG_ERROR)
+            RNS.log(f"Could not decode stamp cost from announce data. The contained exception was: {e}", RNS.LOG_DEBUG)
 
         for lxmessage in self.lxmrouter.pending_outbound:
             if destination_hash     == lxmessage.destination_hash:
@@ -41,6 +41,18 @@ class LXMFPropagationAnnounceHandler:
     def received_announce(self, destination_hash, announced_identity, app_data, announce_packet_hash, is_path_response):
         try:
             if type(app_data) == bytes:
+                if destination_hash == self.lxmrouter.get_outbound_propagation_node():
+                    if pn_announce_data_is_valid(app_data):
+                        for lxmessage in self.lxmrouter.pending_outbound:
+                            if lxmessage.method == LXMessage.PROPAGATED:
+                                lxmessage.next_delivery_attempt = time.time()
+
+                                def outbound_trigger():
+                                    while self.lxmrouter.outbound_processing_lock.locked(): time.sleep(0.1)
+                                    self.lxmrouter.process_outbound()
+
+                                threading.Thread(target=outbound_trigger, daemon=True).start()
+
                 if self.lxmrouter.propagation_node:
                     if pn_announce_data_is_valid(app_data):
                         data                               = msgpack.unpackb(app_data)

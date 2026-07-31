@@ -328,7 +328,7 @@ class LXMPeer:
                                 self.alive = True
                                 self.last_heard = time.time()
                                 self.sync_backoff = 0
-                                min_accepted_cost = min(0, self.propagation_stamp_cost-self.propagation_stamp_cost_flexibility)
+                                min_accepted_cost = max(0, self.propagation_stamp_cost-self.propagation_stamp_cost_flexibility)
 
                                 RNS.log("Synchronisation link to peer "+RNS.prettyhexrep(self.destination_hash)+" established, preparing sync offer...", RNS.LOG_DEBUG)
                                 unhandled_entries = []
@@ -378,9 +378,13 @@ class LXMPeer:
                                     cumulative_size += lxm_transfer_size
                                     unhandled_ids.append(transient_id)
 
+                                if len(unhandled_ids) == 0:
+                                    RNS.log(f"Sync requested for {self}, but no unhandled messages exist after offer preparation. Sync complete.", RNS.LOG_DEBUG)
+                                    return
+
                                 offer = [self.peering_key[0], unhandled_ids]
 
-                                RNS.log(f"Offering {len(unhandled_ids)} messages to peer {RNS.prettyhexrep(self.destination.hash)} ({RNS.prettysize(len(msgpack.packb(unhandled_ids)))})", RNS.LOG_VERBOSE)
+                                RNS.log(f"Offering {len(unhandled_ids)} messages to peer {RNS.prettyhexrep(self.destination.hash)}", RNS.LOG_VERBOSE)
                                 self.last_offer = unhandled_ids
                                 self.link.request(LXMPeer.OFFER_REQUEST_PATH, offer, response_callback=self.offer_response, failed_callback=self.request_failed)
                                 self.state = LXMPeer.REQUEST_SENT
@@ -404,7 +408,7 @@ class LXMPeer:
             if response == LXMPeer.ERROR_NO_IDENTITY:
                 if self.link != None:
                     RNS.log("Remote peer indicated that no identification was received, retrying...", RNS.LOG_VERBOSE)
-                    self.link.identify()
+                    self.link.identify(self.router.identity)
                     self.state = LXMPeer.LINK_READY
                     self.sync()
                     return

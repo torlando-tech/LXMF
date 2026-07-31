@@ -7,7 +7,8 @@ import base64
 import multiprocessing
 
 import LXMF.LXStamper as LXStamper
-from .LXMF import APP_NAME
+from .LXMF import APP_NAME, compression_support_from_app_data
+from threading import Lock
 
 
 class LXMessage:
@@ -113,35 +114,26 @@ class LXMessage:
     def __init__(self, destination, source, content = "", title = "", fields = None, desired_method = None, destination_hash = None, source_hash = None, stamp_cost=None, include_ticket=False):
 
         if isinstance(destination, RNS.Destination) or destination == None:
-            self.__destination    = destination
-            if destination != None:
-                self.destination_hash = destination.hash
-            else:
-                self.destination_hash = destination_hash
-        else:
-            raise ValueError("LXMessage initialised with invalid destination")
+            self.__destination = destination
+            if destination != None: self.destination_hash = destination.hash
+            else:                   self.destination_hash = destination_hash
+        
+        else: raise ValueError("LXMessage initialised with invalid destination")
 
         if isinstance(source, RNS.Destination) or source == None:
-            self.__source    = source
-            if source != None:
-                self.source_hash = source.hash
-            else:
-                self.source_hash = source_hash
-        else:
-            raise ValueError("LXMessage initialised with invalid source")
+            self.__source = source
+            if source != None: self.source_hash = source.hash
+            else:              self.source_hash = source_hash
+        
+        else: raise ValueError("LXMessage initialised with invalid source")
 
-        if title == None:
-            title = ""
+        if title == None: title = ""
 
-        if type(title) == bytes:
-            self.set_title_from_bytes(title)
-        else:
-            self.set_title_from_string(title)
+        if type(title) == bytes:   self.set_title_from_bytes(title)
+        else:                      self.set_title_from_string(title)
 
-        if type(content) == bytes:
-            self.set_content_from_bytes(content)
-        else:
-            self.set_content_from_string(content)
+        if type(content) == bytes: self.set_content_from_bytes(content)
+        else:                      self.set_content_from_string(content)
 
         self.set_fields(fields)
 
@@ -151,6 +143,7 @@ class LXMessage:
         self.hash                    = None
         self.transient_id            = None
         self.packed                  = None
+        self.auto_compress           = True
         self.state                   = LXMessage.GENERATING
         self.method                  = LXMessage.UNKNOWN
         self.progress                = 0.0
@@ -176,6 +169,7 @@ class LXMessage:
         self.paper_packed            = None
 
         self.incoming                = False
+        self.source_blackholed       = False
         self.signature_validated     = False
         self.unverified_reason       = None
         self.ratchet_id              = None
@@ -191,6 +185,7 @@ class LXMessage:
         self.__delivery_destination  = None
         self.__delivery_callback     = None
         self.__pn_encrypted_data     = None
+        self.__persist_lock          = Lock()
         self.failed_callback         = None
         
         self.deferred_stamp_generating = False
@@ -467,6 +462,7 @@ class LXMessage:
 
     def send(self):
         self.determine_transport_encryption()
+        self.determine_compression_support()
 
         if self.method == LXMessage.OPPORTUNISTIC:
             lxm_packet = self.__as_packet()
@@ -511,6 +507,15 @@ class LXMessage:
                 self.resource_representation = self.__as_resource()
                 self.progress = 0.10
 
+    def determine_compression_support(self):
+        app_data = RNS.Identity.recall_app_data(self.destination_hash)
+        if app_data: self.auto_compress = compression_support_from_app_data(app_data)
+        else:        self.auto_compress = True
+
+        ###### TODO: Remove debug logging
+        if app_data: RNS.log(f"Set compression support from app data to: {self.auto_compress}", RNS.LOG_DEBUG)
+        else:        RNS.log(f"Defaulting compression support to {self.auto_compress}", RNS.LOG_DEBUG)
+        ###### 
 
     def determine_transport_encryption(self):
         # TODO: These descriptions are old and outdated.
@@ -646,7 +651,7 @@ class LXMessage:
             raise ConnectionError("Tried to synthesize resource for LXMF message on a link that was not active")
 
         if self.method == LXMessage.DIRECT:
-            return RNS.Resource(self.packed, self.__delivery_destination, callback = self.__resource_concluded, progress_callback = self.__update_transfer_progress)
+            return RNS.Resource(self.packed, self.__delivery_destination, callback = self.__resource_concluded, progress_callback = self.__update_transfer_progress, auto_compress=self.auto_compress)
         elif self.method == LXMessage.PROPAGATED:
             return RNS.Resource(self.propagation_packed, self.__delivery_destination, callback = self.__propagation_resource_concluded, progress_callback = self.__update_transfer_progress)
         else:
@@ -666,21 +671,29 @@ class LXMessage:
 
         return msgpack.packb(container)
 
-
     def write_to_directory(self, directory_path):
         file_name = RNS.hexrep(self.hash, delimit=False)
         file_path = directory_path+"/"+file_name
+        tmp_path  = file_path+".tmp."+str(os.getpid() or time.time())+"."+RNS.hexrep(os.urandom(8), delimit=False)
 
-        try:
-            file = open(file_path, "wb")
-            file.write(self.packed_container())
-            file.close()
+        with self.__persist_lock:
+            try:
+                with open(tmp_path, "wb") as file:
+                    file.write(self.packed_container())
+                    file.flush()
+                    try: os.fsync(file.fileno())
+                    except OSError as e: RNS.log(f"Error while waiting for persist fsync for {self}: {e}", RNS.LOG_WARNING)
 
-            return file_path
+                os.replace(tmp_path, file_path)
+                return file_path
 
-        except Exception as e:
-            RNS.log("Error while writing LXMF message to file \""+str(file_path)+"\". The contained exception was: "+str(e), RNS.LOG_ERROR)
-            return None
+            except Exception as e:
+                try:
+                    if os.path.exists(tmp_path): os.unlink(tmp_path)
+                except Exception as e: RNS.log(f"Error while cleaning temporary file {tmp_path} for {self}: {e}", RNS.LOG_ERROR)
+
+                RNS.log(f"Error while writing LXMF message to file \"{file_path}\". The contained exception was: {e}", RNS.LOG_ERROR)
+                return None
 
     def as_uri(self, finalise=True):
         if not self.packed:
@@ -754,13 +767,13 @@ class LXMessage:
         content_bytes        = unpacked_payload[2]
         fields               = unpacked_payload[3]
 
-        destination_identity = RNS.Identity.recall(destination_hash)
+        destination_identity = RNS.Identity.recall(destination_hash, _no_use=True)
         if destination_identity != None:
             destination = RNS.Destination(destination_identity, RNS.Destination.OUT, RNS.Destination.SINGLE, APP_NAME, "delivery")
         else:
             destination = None
         
-        source_identity = RNS.Identity.recall(source_hash)
+        source_identity = RNS.Identity.recall(source_hash, _no_use=True)
         if source_identity != None:
             source = RNS.Destination(source_identity, RNS.Destination.OUT, RNS.Destination.SINGLE, APP_NAME, "delivery")
         else:
@@ -786,6 +799,10 @@ class LXMessage:
         message.packed_size = len(lxmf_bytes)
         message.set_title_from_bytes(title_bytes)
         message.set_content_from_bytes(content_bytes)
+
+        try:
+            if source_identity != None: message.source_blackholed = RNS.Reticulum.get_instance().is_blackholed(source_identity)
+        except Exception as e: RNS.log(f"Could not determine message source blackhole status: {e}", RNS.LOG_WARNING)
 
         try:
             if source:

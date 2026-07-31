@@ -87,12 +87,17 @@ def apply_config():
         else:
             active_configuration["peer_announce_interval"] = None
         
+        if "lxmf" in lxmd_config and "stamp_cost" in lxmd_config["lxmf"]:
+            active_configuration["peer_stamp_cost"] = max(1, lxmd_config["lxmf"].as_int("stamp_cost"))
+        else:
+            active_configuration["peer_stamp_cost"] = 12
+        
         if "lxmf" in lxmd_config and "delivery_transfer_max_accepted_size" in lxmd_config["lxmf"]:
             active_configuration["delivery_transfer_max_accepted_size"] = lxmd_config["lxmf"].as_float("delivery_transfer_max_accepted_size")
             if active_configuration["delivery_transfer_max_accepted_size"] < 0.38:
                 active_configuration["delivery_transfer_max_accepted_size"] = 0.38
         else:
-            active_configuration["delivery_transfer_max_accepted_size"] = 1000
+            active_configuration["delivery_transfer_max_accepted_size"] = 1
 
         if "lxmf" in lxmd_config and "on_inbound" in lxmd_config["lxmf"]:
             active_configuration["on_inbound"] = lxmd_config["lxmf"]["on_inbound"]
@@ -129,6 +134,21 @@ def apply_config():
             active_configuration["autopeer_maxdepth"] = lxmd_config["propagation"].as_int("autopeer_maxdepth")
         else:
             active_configuration["autopeer_maxdepth"] = None
+
+        if "propagation" in lxmd_config and "sequential_pn_stamp_validation" in lxmd_config["propagation"]:
+            active_configuration["sequential_pn_stamp_validation"] = lxmd_config["propagation"].as_bool("sequential_pn_stamp_validation")
+        else:
+            active_configuration["sequential_pn_stamp_validation"] = True
+
+        if "propagation" in lxmd_config and "static_peers_bypass_sequential" in lxmd_config["propagation"]:
+            active_configuration["static_peers_bypass_sequential"] = lxmd_config["propagation"].as_bool("static_peers_bypass_sequential")
+        else:
+            active_configuration["static_peers_bypass_sequential"] = True
+
+        if "propagation" in lxmd_config and "max_inbound_syncs" in lxmd_config["propagation"]:
+            active_configuration["max_inbound_syncs"] = max(1, lxmd_config["propagation"].as_int("max_inbound_syncs"))
+        else:
+            active_configuration["max_inbound_syncs"] = 3
 
         if "propagation" in lxmd_config and "announce_interval" in lxmd_config["propagation"]:
             active_configuration["node_announce_interval"] = lxmd_config["propagation"].as_int("announce_interval")*60
@@ -285,8 +305,7 @@ def lxmf_delivery(lxm):
             processing_command = command+" \""+written_path+"\""
             return_code = subprocess.call(shlex.split(processing_command), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        else:
-            RNS.log("No action defined for inbound messages, ignoring", RNS.LOG_DEBUG)
+        else: RNS.log("No action defined for inbound messages, ignoring", RNS.LOG_DEBUG)
 
     except Exception as e:
         RNS.log("Error occurred while processing received message "+str(lxm)+". The contained exception was: "+str(e), RNS.LOG_ERROR)
@@ -307,7 +326,7 @@ def program_setup(configdir = None, rnsconfigdir = None, run_pn = False, on_inbo
     if configdir == None:
         if os.path.isdir("/etc/lxmd") and os.path.isfile("/etc/lxmd/config"):
             configdir = "/etc/lxmd"
-        elif os.path.isdir(RNS.Reticulum.userdir+"/.config/lxmd") and os.path.isfile(Reticulum.userdir+"/.config/lxmd/config"):
+        elif os.path.isdir(RNS.Reticulum.userdir+"/.config/lxmd") and os.path.isfile(RNS.Reticulum.userdir+"/.config/lxmd/config"):
             configdir = RNS.Reticulum.userdir+"/.config/lxmd"
         else:
             configdir = RNS.Reticulum.userdir+"/.lxmd"
@@ -319,11 +338,8 @@ def program_setup(configdir = None, rnsconfigdir = None, run_pn = False, on_inbo
     storagedir   = configdir+"/storage"
     lxmdir       = storagedir+"/messages"
 
-    if not os.path.isdir(storagedir):
-        os.makedirs(storagedir)
-
-    if not os.path.isdir(lxmdir):
-        os.makedirs(lxmdir)
+    if not os.path.isdir(storagedir): os.makedirs(storagedir)
+    if not os.path.isdir(lxmdir):     os.makedirs(lxmdir)
 
     if not os.path.isfile(configpath):
         RNS.log("Could not load config file, creating default configuration file...")
@@ -351,6 +367,7 @@ def program_setup(configdir = None, rnsconfigdir = None, run_pn = False, on_inbo
     # Start Reticulum
     RNS.log("Substantiating Reticulum...")
     reticulum = RNS.Reticulum(configdir=rnsconfigdir, loglevel=targetloglevel, logdest=targetlogdest)
+    if targetlogdest == RNS.LOG_FILE: RNS.logfile = configdir+"/logfile"
 
     # Generate or load primary identity
     if os.path.isfile(identitypath):
@@ -385,6 +402,9 @@ def program_setup(configdir = None, rnsconfigdir = None, run_pn = False, on_inbo
         propagation_limit = active_configuration["propagation_transfer_max_accepted_size"],
         propagation_cost = active_configuration["propagation_stamp_cost_target"],
         propagation_cost_flexibility = active_configuration["propagation_stamp_cost_flexibility"],
+        sequential_validation = active_configuration["sequential_pn_stamp_validation"],
+        static_sequential = not active_configuration["static_peers_bypass_sequential"],
+        max_inbound_syncs = active_configuration["max_inbound_syncs"],
         peering_cost = active_configuration["peering_cost"],
         max_peering_cost = active_configuration["remote_peering_cost_max"],
         sync_limit = active_configuration["propagation_sync_max_accepted_size"],
@@ -399,7 +419,8 @@ def program_setup(configdir = None, rnsconfigdir = None, run_pn = False, on_inbo
     for destination_hash in active_configuration["ignored_lxmf_destinations"]:
         message_router.ignore_destination(destination_hash)
 
-    lxmf_destination = message_router.register_delivery_identity(identity, display_name=active_configuration["display_name"])
+    lxmf_destination = message_router.register_delivery_identity(identity, display_name=active_configuration["display_name"],
+                                                                 stamp_cost=active_configuration["peer_stamp_cost"])
 
     RNS.Identity.remember(
         packet_hash=None,
@@ -772,7 +793,7 @@ def get_status(remote=None, configdir=None, rnsconfigdir=None, verbosity=0, quie
                 srxb = RNS.prettysize(p["rx_bytes"]); stxb = RNS.prettysize(p["tx_bytes"]); pmo = pm["offered"]; pmout = pm["outgoing"]
                 pmi  = pm["incoming"]; pmuh = pm["unhandled"]; ar = round(p["acceptance_rate"]*100, 2)
                 if p["name"] == None: nn = ""
-                else: nn = p["name"].strip().replace("\n", "").replace("\r", "")
+                else: nn = sanitize_name(p["name"])
                 if len(nn) > 45: nn = f"{nn[:45]}..."
                 print(f"{ind}{t}{RNS.prettyhexrep(peer_id)}")
                 if len(nn): print(f"{ind*2}Name       : {nn}")
@@ -824,7 +845,7 @@ def _remote_init(configdir=None, rnsconfigdir=None, verbosity=0, quietness=0, id
     if identity_path == None:
         if configdir == None:
             if os.path.isdir("/etc/lxmd") and os.path.isfile("/etc/lxmd/config"): configdir = "/etc/lxmd"
-            elif os.path.isdir(RNS.Reticulum.userdir+"/.config/lxmd") and os.path.isfile(Reticulum.userdir+"/.config/lxmd/config"): configdir = RNS.Reticulum.userdir+"/.config/lxmd"
+            elif os.path.isdir(RNS.Reticulum.userdir+"/.config/lxmd") and os.path.isfile(RNS.Reticulum.userdir+"/.config/lxmd/config"): configdir = RNS.Reticulum.userdir+"/.config/lxmd"
             else: configdir = RNS.Reticulum.userdir+"/.lxmd"
 
         configpath   = configdir+"/config"
@@ -971,7 +992,7 @@ autopeer = yes
 # The maximum peering depth (in hops) for
 # automatically peered nodes.
 
-autopeer_maxdepth = 4
+autopeer_maxdepth = 6
 
 # The maximum amount of storage to use for
 # the LXMF Propagation Node message store,
@@ -1062,6 +1083,33 @@ autopeer_maxdepth = 4
 
 # from_static_only = True
 
+# By default, stamp validation jobs for PN
+# sync batches will run sequentially. If
+# a peer offers messages while another batch
+# is already processing, it will receive a
+# throttle response to indicate that it can
+# retry later. If you have a fast system, you
+# can disable this to accept and validate
+# everything as soon as it is offered.
+
+# sequential_pn_stamp_validation = yes
+
+# You can configure whether static peers are
+# allowed have their PN syncs processed as
+# soon as they are offered, regardless of
+# whether another batch is already validating.
+
+# static_peers_bypass_sequential = yes
+
+# You can configure how many concurrent inbound
+# propagation sync transfers will be accepted.
+# Once this number is reached, nodes offering
+# messages will receive a throttle response to
+# indicate that they can retry later. On a slow
+# system, it's a good idea to change this to 1.
+
+# max_inbound_syncs = 3
+
 # By default, any destination is allowed to
 # connect and download messages, but you can
 # optionally restrict this. If you enable
@@ -1091,13 +1139,18 @@ announce_at_start = no
 
 # announce_interval = 360
 
+# You can configure the required stamp cost for
+# incoming messages.
+
+# stamp_cost = 12
+
 # The maximum accepted unpacked size for mes-
 # sages received directly from other peers,
 # specified in kilobytes. Messages larger than
 # this will be rejected before the transfer
 # begins.
 
-delivery_transfer_max_accepted_size = 1000
+delivery_transfer_max_accepted_size = 1
 
 # You can configure an external program to be run
 # every time a message is received. The program
@@ -1124,5 +1177,77 @@ loglevel = 4
 
 """
 
-if __name__ == "__main__":
-    main()
+import re
+import unicodedata
+STRIP_BLOCKS_RE = re.compile(
+    '['
+    '\U0001F600-\U0001F64F'  # Emoticons
+    '\U0001F300-\U0001F5FF'  # Misc Symbols & Pictographs
+    '\U0001F680-\U0001F6FF'  # Transport & Map Symbols
+    '\U0001F700-\U0001F77F'  # Alchemical Symbols
+    '\U0001F780-\U0001F7FF'  # Geometric Shapes Extended
+    '\U0001F800-\U0001F8FF'  # Supplemental Arrows-C
+    '\U0001F900-\U0001F9FF'  # Supplemental Symbols & Pictographs
+    '\U0001FA00-\U0001FA6F'  # Chess Symbols
+    '\U0001FA70-\U0001FAFF'  # Symbols & Pictographs Extended-A
+    '\U0001F1E0-\U0001F1FF'  # Flags (iOS/regional indicators)
+    '\u2600-\u26FF'          # Misc Symbols (☀, ☁, ☂, etc.)
+    '\u2700-\u27BF'          # Dingbats (✂, ✈, ✉, etc.)
+    '\uFE00-\uFE0F'          # Variation Selectors
+    '\U000E0100-\U000E01EF'  # Variation Selectors Supplement
+    '\U0001F3FB-\U0001F3FF'  # Emoji modifiers (skin tones)
+    ']+',
+    flags=re.UNICODE
+)
+
+STRIP_CONTROL_RE = re.compile(
+    '['
+    '\x00-\x08'      # C0 controls (NUL-BS)
+    '\x0B\x0C'       # VT, FF
+    '\x0E-\x1F'      # C0 controls (SO-US)
+    '\x7F-\x9F'      # DEL and C1 controls
+    '\u200B-\u200F'  # Zero-width chars, LRM, RLM, etc.
+    '\u202A-\u202E'  # Bidi embedding controls
+    '\u2060-\u206F'  # Format chars (word joiner, etc.)
+    '\uFEFF'         # BOM / Zero Width NBSP
+    '\uFFF0-\uFFF8'  # Specials
+    ']+',
+    flags=re.UNICODE
+)
+
+STRIP_PRIVATE_RE = re.compile(
+    '['
+    '\uD800-\uDFFF'         # Surrogates
+    '\uE000-\uF8FF'         # Private Use Area
+    '\uF900-\uFAFF'         # CJK Compatibility Ideographs (keep? strip for safety)
+    '\uFE10-\uFE1F'         # Vertical Forms
+    '\uFE20-\uFE2F'         # Combining Half Marks
+    '\U000F0000-\U000FFFFF' # Supplementary Private Use Area-A
+    '\U00100000-\U0010FFFF' # Supplementary Private Use Area-B
+    ']+',
+    flags=re.UNICODE
+)
+
+def sanitize_name(name):
+    if name is None: return None
+    name = str(name)
+    name = unicodedata.normalize('NFKC', name)    
+    result = []
+    for char in name:
+        cat = unicodedata.category(char)
+        cat_prefix = cat[0] if cat else 'C'
+        if cat_prefix in ('L', 'N', 'P'): result.append(char)
+        elif cat == 'Zs': result.append(' ')
+        elif cat in ('Zl', 'Zp'): result.append(' ')
+        elif cat == 'Mc': result.append(char)
+        elif cat == 'Lm': result.append(char)
+
+    name = ''.join(result)    
+    name = STRIP_BLOCKS_RE.sub('', name)
+    name = STRIP_CONTROL_RE.sub('', name)
+    name = STRIP_PRIVATE_RE.sub('', name)
+    name = re.sub(r'\s+', ' ', name)
+    name = name.strip()
+    return name
+
+if __name__ == "__main__": main()
