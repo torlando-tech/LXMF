@@ -37,6 +37,7 @@ class LXMRouter:
 
     MESSAGE_EXPIRY        = 30*24*60*60
     STAMP_COST_EXPIRY     = 45*24*60*60
+    STAMP_COST_PERSIST_INTERVAL = 60
 
     NODE_ANNOUNCE_DELAY   = 20
 
@@ -177,6 +178,8 @@ class LXMRouter:
         self.delivered_transient_ids_lock = threading.Lock()
         self.processed_transient_ids_lock = threading.Lock()
         self.cost_file_lock = threading.Lock()
+        self.stamp_costs_dirty = False
+        self.last_stamp_cost_save = time.monotonic()
         self.ticket_file_lock = threading.Lock()
         self.stamp_gen_lock = threading.Lock()
         self.accepted_offer_links_lock = threading.Lock()
@@ -881,6 +884,9 @@ class LXMRouter:
         if not self.exit_handler_running:
             self.processing_count += 1
 
+            if self.stamp_costs_dirty and time.monotonic() >= self.last_stamp_cost_save + LXMRouter.STAMP_COST_PERSIST_INTERVAL:
+                self.save_outbound_stamp_costs()
+
             if self.processing_count % LXMRouter.JOB_OUTBOUND_INTERVAL == 0:
                 self.process_outbound()
 
@@ -1026,10 +1032,10 @@ class LXMRouter:
 
     def update_stamp_cost(self, destination_hash, stamp_cost):
         RNS.log(f"Updating outbound stamp cost for {RNS.prettyhexrep(destination_hash)} to {stamp_cost}", RNS.LOG_PATHING) if RNS.sl(RNS.LOG_PATHING) else None
-        self.outbound_stamp_costs[destination_hash] = [time.time(), stamp_cost]
-        
-        def job(): self.save_outbound_stamp_costs()
-        threading.Thread(target=self.save_outbound_stamp_costs, daemon=True).start()
+        with self.cost_file_lock:
+            if self.exit_handler_running: return
+            self.outbound_stamp_costs[destination_hash] = [time.time(), stamp_cost]
+            self.stamp_costs_dirty = True
 
     def get_announce_app_data(self, destination_hash):
         if destination_hash in self.delivery_destinations:
@@ -1286,17 +1292,25 @@ class LXMRouter:
 
     def save_outbound_stamp_costs(self):
         with self.cost_file_lock:
+            temp_path = None
             try:
                 if not os.path.isdir(self.storagepath): os.makedirs(self.storagepath)
 
                 write_path = self.storagepath+"/outbound_stamp_costs"
                 temp_path  = write_path+".tmp."+str(time.time())
                 with open(temp_path, "wb") as outbound_stamp_costs_file:
-                    outbound_stamp_costs_file.write(msgpack.packb(self.outbound_stamp_costs.copy()))
+                    outbound_stamp_costs_file.write(msgpack.packb(self.outbound_stamp_costs))
                 os.replace(temp_path, write_path)
+                temp_path = None
+                self.stamp_costs_dirty = False
+                self.last_stamp_cost_save = time.monotonic()
 
             except Exception as e:
                 RNS.log("Could not save outbound stamp costs to storage. The contained exception was: "+str(e), RNS.LOG_ERROR)
+            finally:
+                if temp_path != None:
+                    try: os.unlink(temp_path)
+                    except OSError: pass
 
     def clean_available_tickets(self):
         try:
@@ -1365,10 +1379,11 @@ class LXMRouter:
             RNS.log(f"An error occurred while reloading available tickets from storage: {e}", RNS.LOG_ERROR)
 
     def exit_handler(self):
-        if self.exit_handler_running:
-            return
+        with self.cost_file_lock:
+            if self.exit_handler_running: return
+            self.exit_handler_running = True
 
-        self.exit_handler_running = True
+        if self.stamp_costs_dirty: self.save_outbound_stamp_costs()
 
         RNS.log("Tearing down delivery destinations...", RNS.LOG_NOTICE)
         for destination_hash in self.delivery_destinations:

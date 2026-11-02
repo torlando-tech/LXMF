@@ -89,6 +89,14 @@ lxm_router.handle_outbound(message)
 
 The LXM Router then handles the heavy lifting, such as message packing, encryption, delivery confirmation, path lookup, routing, retries and failure notifications.
 
+Outbound stamp-cost updates take effect immediately in memory. Dirty updates are
+persisted atomically by the maintenance loop, normally once per 60 seconds plus
+job-loop delay, and flushed on clean shutdown. `save_outbound_stamp_costs()` still
+provides an immediate explicit flush. Failed saves preserve the previous file and
+remain pending for the next maintenance tick. Abrupt termination can lose updates
+since the last successful flush; message storage is unaffected. Stamp-cost updates
+are ignored after shutdown begins.
+
 ## Transport Encryption
 
 LXMF uses encryption provided by [Reticulum](https://reticulum.network), and thus uses end-to-end encryption by default. The delivery method of a message will influence which transport encryption scheme is used.
