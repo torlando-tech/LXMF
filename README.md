@@ -99,6 +99,36 @@ lxm_router.handle_outbound(message)
 
 The LXM Router then handles the heavy lifting, such as message packing, encryption, delivery confirmation, path lookup, routing, retries and failure notifications.
 
+### Columba embedded integration
+
+This branch pairs with the current Reticulum `RNS.Stamps` API, including its
+`size` and `no_expand` arguments. Ordinary stamp generation and cancellation
+remain delegated to Reticulum, with LXMF's 32-byte stamp size. SQLite storage
+remains upstream's implementation; no stamp-cost coalescing patch is applied.
+
+Embedded hosts can register native stamp generation through
+`LXMF.LXStamper.set_external_generator(generator, cancellation_callback=None,
+pass_cancellation_token=None)`. The generator receives `(workblock, cost)` or
+`(workblock, cost, token)` and returns `(stamp, rounds)`: a 32-byte `bytes` stamp
+and a non-boolean integer work count from zero through `2**63-1`. The cost is
+passed unchanged, including fractional costs, and results are validated with
+Reticulum's canonical `stamp_valid` before returning the canonical stamp value.
+Native adapters must support fractional costs; this branch does not migrate
+application-side native adapters.
+
+Token-aware callbacks are detected by signature, or explicitly selected with
+`pass_cancellation_token=True` for opaque bridge callables. The token provides
+`message_id`, `cancelled`, `is_cancelled()`, and `wait(timeout=None)`. The optional
+cancellation callback receives the same token, runs at most once per job outside
+the jobs lock, and should stop native work. Clearing or replacing registration
+cancels outstanding external jobs; cancelled or stale results are discarded.
+Without a native cancellation hook, late results are still discarded.
+
+For opportunistic reception, the delivery callback's `LXMessage` exposes
+`receiving_interface` and `receiving_hops` when supplied by the packet. These
+values are captured before asynchronous parsing, without requiring a populated
+path table.
+
 ## Transport Encryption
 
 LXMF uses encryption provided by [Reticulum](https://reticulum.network), and thus uses end-to-end encryption by default. The delivery method of a message will influence which transport encryption scheme is used.
