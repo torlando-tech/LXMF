@@ -103,8 +103,10 @@ The LXM Router then handles the heavy lifting, such as message packing, encrypti
 
 This branch pairs with the current Reticulum `RNS.Stamps` API, including its
 `size` and `no_expand` arguments. Ordinary stamp generation and cancellation
-remain delegated to Reticulum, with LXMF's 32-byte stamp size. SQLite storage
-remains upstream's implementation; no stamp-cost coalescing patch is applied.
+remain delegated to Reticulum, with LXMF's 32-byte stamp size. SQLite persistence
+remains upstream's policy; no stamp-cost coalescing patch is applied. The existing
+connection mutex permits both multi-thread and serialized SQLite builds; builds
+without thread support are rejected.
 
 Embedded hosts can register native stamp generation through
 `LXMF.LXStamper.set_external_generator(generator, cancellation_callback=None,
