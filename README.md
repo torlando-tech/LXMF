@@ -99,6 +99,21 @@ lxm_router.handle_outbound(message)
 
 The LXM Router then handles the heavy lifting, such as message packing, encryption, delivery confirmation, path lookup, routing, retries and failure notifications.
 
+### Columba embedded integration
+
+This branch is based on upstream LXMF 1.3.0. `LXMF.LXStamper` remains the
+upstream wrapper around `RNS.Stamps`, with LXMF's 32-byte stamp size.
+Native hash search is registered with Reticulum, not LXMF.
+
+For opportunistic reception, the delivery callback's `LXMessage` exposes
+`receiving_interface` and `receiving_hops` when supplied by the packet. These
+values are captured before asynchronous parsing, without requiring a populated
+path table.
+
+SQLite persistence retains upstream policy, including stamp-cost updates.
+The existing connection mutex permits both multi-thread and serialized SQLite
+builds; builds without thread support are rejected.
+
 ## Transport Encryption
 
 LXMF uses encryption provided by [Reticulum](https://reticulum.network), and thus uses end-to-end encryption by default. The delivery method of a message will influence which transport encryption scheme is used.

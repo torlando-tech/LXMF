@@ -2162,7 +2162,7 @@ class LXMRouter:
     ### Message Routing & Delivery ########################
     #######################################################
 
-    def lxmf_delivery(self, lxmf_data, destination_type = None, phy_stats = None, ratchet_id = None, method = None, no_stamp_enforcement=False, allow_duplicate=False):
+    def lxmf_delivery(self, lxmf_data, destination_type = None, phy_stats = None, ratchet_id = None, method = None, no_stamp_enforcement=False, allow_duplicate=False, receiving_interface = None, receiving_hops = None):
         try:
             message = LXMessage.unpack_from_bytes(lxmf_data)
 
@@ -2172,6 +2172,13 @@ class LXMRouter:
 
             if ratchet_id and not message.ratchet_id: message.ratchet_id = ratchet_id
             if method: message.method = method
+
+            # Opportunistic packets can precede path discovery. Keep their
+            # reception metadata available to the delivery callback.
+            if receiving_interface is not None:
+                message.receiving_interface = receiving_interface
+            if receiving_hops is not None:
+                message.receiving_hops = receiving_hops
 
             if message.signature_validated and FIELD_TICKET in message.fields:
                 ticket_entry = message.fields[FIELD_TICKET]
@@ -2282,7 +2289,13 @@ class LXMRouter:
 
             phy_stats = {"rssi": packet.rssi, "snr": packet.snr, "q": packet.q}
 
-            def job(): self.lxmf_delivery(lxmf_data, packet.destination_type, phy_stats=phy_stats, ratchet_id=packet.ratchet_id, method=method)
+            receiving_interface = None
+            receiving_hops = None
+            if method == LXMessage.OPPORTUNISTIC:
+                receiving_interface = getattr(packet, "receiving_interface", None)
+                receiving_hops = getattr(packet, "hops", None)
+
+            def job(): self.lxmf_delivery(lxmf_data, packet.destination_type, phy_stats=phy_stats, ratchet_id=packet.ratchet_id, method=method, receiving_interface=receiving_interface, receiving_hops=receiving_hops)
             threading.Thread(target=job, daemon=True).start()
 
         except Exception as e:

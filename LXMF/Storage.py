@@ -20,7 +20,8 @@ class LXMFStore:
     VACUUM_PAGES        = 512
 
     def __init__(self, db_path):
-        if sqlite3.threadsafety < 3: raise RuntimeError("Storage backend requires a SQLite build with serialized threading support")
+        # _conn_lock also serializes connections on SQLite multi-thread builds.
+        if sqlite3.threadsafety < 1: raise RuntimeError("Storage backend requires a SQLite build with threading support")
 
         self.db_path       = db_path
         self._conn         = None
